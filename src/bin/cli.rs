@@ -41,6 +41,9 @@ struct Args {
     debug_gpu: bool,
     #[arg(long, default_value_t=42)]
     seed: u64,
+    /// Number of prompt tokens to process per GPU submit during prefill (GPU only)
+    #[arg(long, default_value_t=512)]
+    prefill_batch: usize,
 }
 
 fn main() -> Result<()> {
@@ -79,8 +82,8 @@ fn main() -> Result<()> {
     eprintln!("Tokenizer: {:?} | Template: {:?} | add_bos: {}",
         tok.tok_model, tmpl, tok.add_bos_token);
     eprintln!("System: {}", &system[..system.len().min(80)]);
-    eprintln!("Params: temp={} top_k={} top_p={} rep_penalty={} smart_context={}",
-        args.temperature, args.top_k, args.top_p, args.rep_penalty, args.smart_context);
+    eprintln!("Params: temp={} top_k={} top_p={} rep_penalty={} smart_context={} prefill_batch={}",
+        args.temperature, args.top_k, args.top_p, args.rep_penalty, args.smart_context, args.prefill_batch);
 
     let c       = &model.config;
     let ctx_len = args.ctx_len.min(c.n_ctx);
@@ -100,14 +103,14 @@ fn main() -> Result<()> {
             print!("{}", p); io::stdout().flush()?;
             let ids = tok.encode(p, true);
             let t0  = Instant::now();
-            let (mut pos, mut logits) = prefill_split(&model, &ids, 0, &mut gpu, &mut cpu_cache);
+            let (mut pos, mut logits) = prefill_split(&model, &ids, 0, &mut gpu, &mut cpu_cache, args.prefill_batch);
             let pm  = t0.elapsed().as_millis();
             let t1  = Instant::now();
             let mut dummy: Vec<u32> = Vec::new();
             let gen = generate_collect(&model, &tok, &mut pos, &mut logits,
                 args.max_tokens, args.temperature, args.top_k, args.top_p,
                 args.rep_penalty, ctx_len, &stops, &mut gpu, &mut cpu_cache,
-                &mut recent, &sys_ids, &mut dummy, args.smart_context);
+                &mut recent, &sys_ids, &mut dummy, args.smart_context, args.prefill_batch);
             println!();
             if args.stats {
                 let gs = t1.elapsed().as_secs_f32();
@@ -124,7 +127,7 @@ fn main() -> Result<()> {
             }
 
             let pt = Instant::now();
-            let (mut pos, _) = prefill_split(&model, &sys_ids, 0, &mut gpu, &mut cpu_cache);
+            let (mut pos, _) = prefill_split(&model, &sys_ids, 0, &mut gpu, &mut cpu_cache, args.prefill_batch);
             if args.stats {
                 eprintln!("[Stats] system prefill: {} tok in {}ms",
                     sys_ids.len(), pt.elapsed().as_millis());
@@ -156,17 +159,17 @@ fn main() -> Result<()> {
                 if pos + turn_ids.len() + reserve >= ctx_len {
                     if history.is_empty() {
                         eprintln!("[Context: too small, clearing conversation]");
-                        let (p, _) = prefill_split(&model, &sys_ids, 0, &mut gpu, &mut cpu_cache);
+                        let (p, _) = prefill_split(&model, &sys_ids, 0, &mut gpu, &mut cpu_cache, args.prefill_batch);
                         pos = p;
                     } else {
                         pos = rebuild_cache(&model, &sys_ids, &mut history,
-                                            &mut gpu, &mut cpu_cache);
+                                            &mut gpu, &mut cpu_cache, args.prefill_batch);
                     }
                 }
 
                 let pt0 = Instant::now();
                 let (new_pos, mut logits) = prefill_split(&model, &turn_ids, pos,
-                                                           &mut gpu, &mut cpu_cache);
+                                                           &mut gpu, &mut cpu_cache, args.prefill_batch);
                 let pm = pt0.elapsed().as_millis();
                 pos = new_pos;
                 history.extend_from_slice(&turn_ids);
@@ -177,7 +180,7 @@ fn main() -> Result<()> {
                     &model, &tok, &mut pos, &mut logits,
                     args.max_tokens, args.temperature, args.top_k, args.top_p,
                     args.rep_penalty, ctx_len, &stops, &mut gpu, &mut cpu_cache,
-                    &mut recent, &sys_ids, &mut history, args.smart_context,
+                    &mut recent, &sys_ids, &mut history, args.smart_context, args.prefill_batch,
                 );
                 history.extend_from_slice(&gen_ids);
                 println!();
@@ -197,11 +200,12 @@ fn main() -> Result<()> {
 }
 
 fn rebuild_cache(
-    model:     &LlamaModel,
-    sys_ids:   &[u32],
-    history:   &mut Vec<u32>,
-    gpu:       &mut Option<VkCtx>,
-    cpu_cache: &mut KvCache,
+    model:        &LlamaModel,
+    sys_ids:      &[u32],
+    history:      &mut Vec<u32>,
+    gpu:          &mut Option<VkCtx>,
+    cpu_cache:    &mut KvCache,
+    prefill_batch: usize,
 ) -> usize {
     let drop_n = (history.len() / 4).max(1).min(history.len());
     history.drain(..drop_n);
@@ -215,7 +219,7 @@ fn rebuild_cache(
         for l in 0..c.n_layers { cpu_cache.k[l].fill(0.0); cpu_cache.v[l].fill(0.0); }
     }
 
-    let (mut pos, _) = prefill_split(model, sys_ids, 0, gpu, cpu_cache);
+    let (mut pos, _) = prefill_split(model, sys_ids, 0, gpu, cpu_cache, prefill_batch);
     for (i, &id) in history.iter().enumerate() {
         let _ = match gpu.as_mut() {
             Some(g) => model.forward_gpu(id as usize, pos + i, g),
@@ -229,19 +233,27 @@ fn rebuild_cache(
 }
 
 fn prefill_split(
-    model:     &LlamaModel,
-    ids:       &[u32],
-    start:     usize,
-    gpu:       &mut Option<VkCtx>,
-    cpu_cache: &mut KvCache,
+    model:        &LlamaModel,
+    ids:          &[u32],
+    start:        usize,
+    gpu:          &mut Option<VkCtx>,
+    cpu_cache:    &mut KvCache,
+    prefill_batch: usize,
 ) -> (usize, Vec<f32>) {
-    let mut logits = vec![0f32; model.config.n_vocab];
-    for (i, &id) in ids.iter().enumerate() {
-        logits = match gpu.as_mut() {
-            Some(g) => model.forward_gpu(id as usize, start + i, g),
-            None    => model.forward_cpu(id as usize, start + i, cpu_cache),
-        };
-    }
+    if ids.is_empty() { return (start, vec![0f32; model.config.n_vocab]); }
+    let logits = match gpu.as_mut() {
+        Some(g) => {
+            let tokens: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
+            model.forward_gpu_prefill(&tokens, start, g, prefill_batch)
+        }
+        None => {
+            let mut logits = vec![0f32; model.config.n_vocab];
+            for (i, &id) in ids.iter().enumerate() {
+                logits = model.forward_cpu(id as usize, start + i, cpu_cache);
+            }
+            logits
+        }
+    };
     (start + ids.len(), logits)
 }
 
@@ -263,6 +275,7 @@ fn generate_collect(
     sys_ids:       &[u32],
     history:       &mut Vec<u32>,
     smart_context: bool,
+    prefill_batch: usize,
 ) -> Vec<u32> {
     let mut generated: Vec<u32> = Vec::new();
 
@@ -275,7 +288,7 @@ fn generate_collect(
             if !smart_context { break; }
             history.extend_from_slice(&generated);
             generated.clear();
-            *pos = rebuild_cache(model, sys_ids, history, gpu, cpu_cache);
+            *pos = rebuild_cache(model, sys_ids, history, gpu, cpu_cache, prefill_batch);
             if let Some(&last_id) = history.last().or(sys_ids.last()) {
                 *last = match gpu.as_mut() {
                     Some(g) => model.forward_gpu(last_id as usize, *pos - 1, g),

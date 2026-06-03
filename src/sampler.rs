@@ -14,7 +14,7 @@ fn rand_f32() -> f32 {
 /// Greedy decode — always picks the highest-probability token
 fn greedy(logits: &[f32]) -> usize {
     logits.iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i).unwrap_or(0)
 }
 
@@ -34,15 +34,20 @@ fn apply_rep_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
 /// clean output for most instruction-tuned models without any extra CLI flags.
 pub fn sample(logits: &mut Vec<f32>, temperature: f32, top_k: usize,
               top_p: f32, rep_penalty: f32, recent: &[u32]) -> usize {
+    // Sanitise any NaN/Inf that the GPU may produce on edge cases
+    for v in logits.iter_mut() {
+        if !v.is_finite() { *v = -1e9; }
+    }
+
     apply_rep_penalty(logits, recent, rep_penalty);
 
     if temperature <= 0.0 { return greedy(logits); }
 
     for v in logits.iter_mut() { *v /= temperature; }
 
-    // Sort (index, scaled_logit) descending
+    // Sort (index, scaled_logit) descending — total_cmp is NaN-safe and branchless
     let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     // top_k: discard everything outside the top k candidates
     if top_k > 0 && top_k < pairs.len() {

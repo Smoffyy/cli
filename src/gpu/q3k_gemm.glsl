@@ -3,7 +3,7 @@ layout(local_size_x=256) in;
 layout(set=0,binding=0) readonly buffer Mat { uint data[]; } mat;
 layout(set=0,binding=1) readonly buffer In  { float data[]; } vin;
 layout(set=0,binding=2) buffer Out { float data[]; } vout;
-layout(push_constant) uniform PC { uint rows; uint bpr; } pc;
+layout(push_constant) uniform PC { uint rows; uint bpr; uint batch; } pc;
 
 // Q3_K superblock = 28 u32s per 256 weights:
 //   [0]       = d (f32)
@@ -13,21 +13,14 @@ layout(push_constant) uniform PC { uint rows; uint bpr; } pc;
 
 shared float sdata[256];
 
-// Read byte k from the 3 packed scale u32s (k in 0..11)
 uint scale_byte(uint blk, uint k) {
     uint word = mat.data[blk + 25u + k / 4u];
     return (word >> ((k % 4u) * 8u)) & 0xFFu;
 }
 
-// Reproduce the ggml Q3_K scale decode (matches dq3k in dequant.rs):
-//   for j in 0..4:
-//     sc[j]    = (scales[j]   & 0x3F) - 32
-//     sc[j+4]  = ((scales[j+4] & 0xF) | ((scales[j] >> 4) << 4)) - 32
-//     sc[j+8]  = (scales[j+8] & 0x3F) - 32
-//     sc[j+12] = ((scales[j+8] >> 4) | ((scales[j+4] >> 4) << 4)) - 32
 float extract_scale(uint blk, uint si) {
     uint j = si % 4u;
-    uint group = si / 4u; // 0=sc[0..3], 1=sc[4..7], 2=sc[8..11], 3=sc[12..15]
+    uint group = si / 4u;
 
     uint s_j  = scale_byte(blk, j);
     uint s_j4 = scale_byte(blk, j + 4u);
@@ -47,27 +40,25 @@ float extract_scale(uint blk, uint si) {
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= pc.rows) return;
-    uint tid = gl_LocalInvocationID.x;
-    float sum = 0.0;
-
+    uint row   = gl_WorkGroupID.x;
+    uint tok_b = gl_WorkGroupID.y;
+    if (row >= pc.rows || tok_b >= pc.batch) return;
+    uint tid      = gl_LocalInvocationID.x;
+    uint in_base  = tok_b * pc.bpr * 256u;
+    float sum     = 0.0;
     uint row_base = row * pc.bpr;
 
     for (uint b = 0u; b < pc.bpr; b++) {
-        uint blk = (row_base + b) * 28u;
-        uint vb  = b * 256u;
+        uint blk    = (row_base + b) * 28u;
+        uint vb     = b * 256u;
         float d_val = uintBitsToFloat(mat.data[blk]);
+        uint i      = tid;
 
-        uint i = tid;
-
-        // 2-bit low quant: qs[i/4] >> (2*(i%4)) & 3  (qs stored as bytes in u32s at blk+9)
         uint qs_byte_idx = i / 4u;
         uint qs_word = mat.data[blk + 9u + qs_byte_idx / 4u];
         uint qs_byte = (qs_word >> ((qs_byte_idx % 4u) * 8u)) & 0xFFu;
         uint qs_2bit = (qs_byte >> ((i % 4u) * 2u)) & 3u;
 
-        // High bit: hmask[i%32] >> (i/32) & 1  (hmask as bytes in u32s at blk+1)
         uint hm_byte_idx = i % 32u;
         uint hm_word = mat.data[blk + 1u + hm_byte_idx / 4u];
         uint hm_byte = (hm_word >> ((hm_byte_idx % 4u) * 8u)) & 0xFFu;
@@ -76,7 +67,7 @@ void main() {
         int q = int(qs_2bit | (hbit << 2u)) - 4;
 
         float sc = extract_scale(blk, i / 16u);
-        sum += d_val * sc * float(q) * vin.data[vb + i];
+        sum += d_val * sc * float(q) * vin.data[in_base + vb + i];
     }
 
     sdata[tid] = sum;
@@ -85,5 +76,5 @@ void main() {
         if (tid < s) sdata[tid] += sdata[tid + s];
         barrier();
     }
-    if (tid == 0u) vout.data[row] = sdata[0];
+    if (tid == 0u) vout.data[tok_b * pc.rows + row] = sdata[0];
 }
